@@ -120,7 +120,7 @@ if __name__ == '__main__':
             input_images = torch.cat([input_images[:, 0:1], input_images, input_images[:, -1:]], dim=1)
             
             if cfg.batch_size < input_images.size(1):
-                num_batches = int(math.ceil((input_images.size(1)) - cfg.padding_frames) / (cfg.batch_size - cfg.padding_frames))
+                num_batches = int(math.ceil((input_images.size(1) - cfg.padding_frames) / (cfg.batch_size - cfg.padding_frames)))
                 flow_pre = []
                 for batch_idx in range(num_batches):
                     print(f"Processing batch {batch_idx} / {num_batches}...")
