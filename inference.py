@@ -4,6 +4,7 @@ import os
 import argparse
 import torch
 import json
+from tqdm import tqdm
 
 from core.Networks import build_network
 
@@ -108,7 +109,7 @@ if __name__ == '__main__':
     
     with torch.no_grad():
 
-        for data in dataloader:
+        for data in tqdm(dataloader):
             input_images = data[0]['frames']
             output_file = data[0]['output_file']
             input_images = input_images[None].to(torch.device(local_rank))
