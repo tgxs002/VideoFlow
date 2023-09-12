@@ -1,122 +1,149 @@
 import sys
 sys.path.append('core')
-
-from PIL import Image
-import argparse
 import os
-import time
-import numpy as np
+import argparse
 import torch
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from core.utils.misc import process_cfg
-from utils import flow_viz
+import json
 
 from core.Networks import build_network
 
-from utils import frame_utils
-from utils.utils import InputPadder, forward_interpolate
-import itertools
-import imageio
+from utils.utils import InputPadder
+from configs.multiframes_sintel_submission import get_cfg
+import cv2
+import numpy as np
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
-def prepare_image(seq_dir):
-    print(f"preparing image...")
-    print(f"Input image sequence dir = {seq_dir}")
+def prepare_image(video_path, target_resolution=432):
 
     images = []
 
-    image_list = sorted(os.listdir(seq_dir))
+    cap = cv2.VideoCapture(video_path)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    for fn in image_list:
-        img = Image.open(os.path.join(seq_dir, fn))
-        img = np.array(img).astype(np.uint8)[..., :3]
-        img = torch.from_numpy(img).permute(2, 0, 1).float()
-        images.append(img)
-    
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Resize the frame
+        height, width, _ = frame.shape
+        if height < width:
+            new_height = target_resolution
+            new_width = int(width * (new_height / height))
+        else:
+            new_width = target_resolution
+            new_height = int(height * (new_width / width))
+        frame = cv2.resize(frame, (new_width, new_height))
+
+        frame = torch.from_numpy(frame).permute(2, 0, 1).float()
+        images.append(frame)
+
+    cap.release()
+
     return torch.stack(images)
 
-def vis_pre(flow_pre, vis_dir):
+class video_dataset(torch.utils.data.Dataset):
+    def __init__(self, instruction_file, input_folder, output_folder, target_resolution=432):
+        self.input_folder = input_folder
+        self.output_folder = output_folder
+        self.target_resolution = target_resolution
 
-    if not os.path.exists(vis_dir):
-        os.makedirs(vis_dir)
+        self.data = []
+        # instruction file is a json
+        with open(instruction_file, 'r') as f:
+            self.data = json.load(f)
 
-    N = flow_pre.shape[0]
+    def __len__(self):
+        return len(self.data)
 
-    for idx in range(N//2):
-        flow_img = flow_viz.flow_to_image(flow_pre[idx].permute(1, 2, 0).numpy())
-        image = Image.fromarray(flow_img)
-        image.save('{}/flow_{:04}_to_{:04}.png'.format(vis_dir, idx+2, idx+3))
-    
-    for idx in range(N//2, N):
-        flow_img = flow_viz.flow_to_image(flow_pre[idx].permute(1, 2, 0).numpy())
-        image = Image.fromarray(flow_img)
-        image.save('{}/flow_{:04}_to_{:04}.png'.format(vis_dir, idx-N//2+2, idx-N//2+1))
+    def __getitem__(self, idx):
+        data_item = self.data[idx]
+        input_video = os.path.join(self.input_folder, data_item['input_video'])
+        output_file = os.path.join(self.output_folder, data_item['output_file'])
 
-@torch.no_grad()
-def MOF_inference(model, cfg):
-
-    model.eval()
-
-    input_images = prepare_image(cfg.seq_dir)
-    input_images = input_images[None].cuda()
-    padder = InputPadder(input_images.shape)
-    input_images = padder.pad(input_images)
-    flow_pre, _ = model(input_images, {})
-    flow_pre = padder.unpad(flow_pre[0]).cpu()
-
-    return flow_pre
-
-@torch.no_grad()
-def BOF_inference(model, cfg):
-
-    model.eval()
-
-    input_images = prepare_image(cfg.seq_dir)
-    input_images = input_images[None].cuda()
-    padder = InputPadder(input_images.shape)
-    input_images = padder.pad(input_images)
-    flow_pre, _ = model(input_images, {})
-    flow_pre = padder.unpad(flow_pre[0]).cpu()
-
-    return flow_pre
+        return dict(
+            frames=prepare_image(input_video, self.target_resolution),
+            output_file=output_file
+        )
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', default='MOF')
-    parser.add_argument('--seq_dir', default='default')
-    parser.add_argument('--vis_dir', default='default')
+    parser.add_argument('--output_file', default='default')
+    parser.add_argument('--instruction_file', required=True, help='path to the instruction file (a json contain the input video path and output file path).')
+    parser.add_argument('--input_folder', required=True)
+    parser.add_argument('--output_folder', required=True)
+    parser.add_argument('--target_resolution', default=128)
+    parser.add_argument('--batch_size', default=30, type=int, help='number of frames to process in a batch.')
+    parser.add_argument('--padding_frames', default=4, type=int, help='number of frames to pad at the beginning and end of the video.')
+    parser.add_argument('--num_workers', default=1, type=int, help='number of workers to use for data loading.')
     
     args = parser.parse_args()
-
-    if args.mode == 'MOF':
-        from configs.multiframes_sintel_submission import get_cfg
-    elif args.mode == 'BOF':
-        from configs.sintel_submission import get_cfg
+    assert args.padding_frames % 2 == 0, "padding_frames must be even."
 
     cfg = get_cfg()
     cfg.update(vars(args))
 
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
     model = torch.nn.DataParallel(build_network(cfg))
     model.load_state_dict(torch.load(cfg.model))
 
-    model.cuda()
+    model.to(torch.device(local_rank))
     model.eval()
 
-    print(cfg.model)
-    print("Parameter Count: %d" % count_parameters(model))
+    if rank == 0:
+        print(cfg.model)
+        print("Parameter Count: %d" % count_parameters(model))
+
+    # build dataloader
+    dataset = video_dataset(cfg.instruction_file, cfg.input_folder, cfg.output_folder, cfg.target_resolution)
+    sampler = DistributedSampler(dataset, shuffle=False, num_replicas=world_size, rank=rank)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=cfg.num_workers, pin_memory=True, sampler=sampler, collate_fn=lambda x: x)
     
     with torch.no_grad():
-        if args.mode == 'MOF':
-            from configs.multiframes_sintel_submission import get_cfg
-            flow_pre = MOF_inference(model.module, cfg)
-        elif args.mode == 'BOF':
-            from configs.sintel_submission import get_cfg
-            flow_pre = BOF_inference(model.module, cfg)
-    
-    vis_pre(flow_pre, cfg.vis_dir)
 
+        for data in dataloader:
+            input_images = data[0]['frames']
+            output_file = data[0]['output_file']
+            input_images = input_images[None].to(torch.device(local_rank))
+            padder = InputPadder(input_images.shape)
+            input_images = padder.pad(input_images)
+            # repeat the first frame and the last frame, so the model can predict both forward and backward flow of the first and last frame
+            input_images = torch.cat([input_images[:, 0:1], input_images, input_images[:, -1:]], dim=1)
+            
+            if cfg.batch_size < input_images.size(1):
+                num_batches = (input_images.size(1)) // (cfg.batch_size - cfg.padding_frames)
+                flow_pre = []
+                for batch_idx in range(num_batches):
+                    print(f"Processing batch {batch_idx} / {num_batches}...")
+                    batch_images = input_images[:, batch_idx * (cfg.batch_size - cfg.padding_frames) : (batch_idx + 1) * (cfg.batch_size - cfg.padding_frames) + cfg.padding_frames]
+                    batch_flow, _ = model.module(batch_images, {})
+                    batch_flow = padder.unpad(batch_flow[0]).cpu()
+                    batch_flow = batch_flow.unflatten(0, (2, -1))
+                    if len(flow_pre) > 0:
+                        flow_pre[-1] = flow_pre[-1][:, :- (cfg.padding_frames - 2) // 2]
+                        batch_flow = batch_flow[:, (cfg.padding_frames - 2) // 2:]
+                    flow_pre.append(batch_flow)
+                flow_pre = torch.cat(flow_pre, dim=1)
+            else:
+                batch_flow, _ = model.module(input_images, {})
+                batch_flow = padder.unpad(batch_flow[0]).cpu()
+                flow_pre = batch_flow.unflatten(0, (2, -1))
 
+            # remove the redundant prediction of the first and last frame
+            forward_flow = flow_pre[0, :-1]
+            backward_flow = flow_pre[1, 1:]
+            flow_pre = torch.stack([forward_flow, backward_flow], dim=0)
 
+            # the first is forward flow, the second is backward flow
+            # convert from torch tensor to numpy array
+            flow_pre = flow_pre.cpu().numpy().astype(np.float16)
+
+            # save as npy
+            np.save(output_file, flow_pre)
