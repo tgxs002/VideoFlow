@@ -76,7 +76,7 @@ if __name__ == '__main__':
     parser.add_argument('--instruction_file', required=True, help='path to the instruction file (a json contain the input video path and output file path).')
     parser.add_argument('--input_folder', required=True)
     parser.add_argument('--output_folder', required=True)
-    parser.add_argument('--target_resolution', default=128)
+    parser.add_argument('--target_resolution', type=int, default=128)
     parser.add_argument('--batch_size', default=30, type=int, help='number of frames to process in a batch.')
     parser.add_argument('--padding_frames', default=4, type=int, help='number of frames to pad at the beginning and end of the video.')
     parser.add_argument('--num_workers', default=1, type=int, help='number of workers to use for data loading.')
