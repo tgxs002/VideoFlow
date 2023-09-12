@@ -4,6 +4,7 @@ import os
 import argparse
 import torch
 import json
+import math
 from tqdm import tqdm
 
 from core.Networks import build_network
@@ -119,7 +120,7 @@ if __name__ == '__main__':
             input_images = torch.cat([input_images[:, 0:1], input_images, input_images[:, -1:]], dim=1)
             
             if cfg.batch_size < input_images.size(1):
-                num_batches = (input_images.size(1)) // (cfg.batch_size - cfg.padding_frames)
+                num_batches = math.ceil((input_images.size(1)) - cfg.padding_frames) / (cfg.batch_size - cfg.padding_frames)
                 flow_pre = []
                 for batch_idx in range(num_batches):
                     print(f"Processing batch {batch_idx} / {num_batches}...")
@@ -133,6 +134,8 @@ if __name__ == '__main__':
                     flow_pre.append(batch_flow)
                 flow_pre = torch.cat(flow_pre, dim=1)
             else:
+                # patch 
+                continue
                 batch_flow, _ = model.module(input_images, {})
                 batch_flow = padder.unpad(batch_flow[0]).cpu()
                 flow_pre = batch_flow.unflatten(0, (2, -1))
